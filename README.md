@@ -164,3 +164,154 @@ bun run test
 - `src/test/prices.test.ts` — hits the real upstream RPC (via the env-configured URL) and asserts the response is an array of `{ chainId, address, price }` entries, every entry has `chainId === 1`, ETH is present at the zero address with a non-null price (validates the WETH substitution), and CORS headers are present.
 
 The prices test is effectively an integration test and depends on upstream liveness. Mocking viem at the wire level was considered and rejected as fragile (Multicall3 responses are ABI-encoded per-call).
+
+---
+
+## TODO — Billing endpoint
+
+Not yet implemented. This section captures the design decisions reached so far so we can pick up where we left off. Code has **not** been written.
+
+### Model
+
+**Credits are the universal currency.** Every paid endpoint consumes N credits per call, where N is defined in a per-endpoint config file. Two funding sources feed the same credit ledger:
+
+```
+Stripe subscription  ──┐
+                       ├──► credit ledger  ◄── request pipeline (deducts per call)
+Crypto top-up        ──┘
+```
+
+- **Crypto (primary, privacy-preserving)**: pay-as-you-go top-ups. Customer sends USDC via a payment smart contract and gets credits added to their balance. This is the default path, aligned with the rest of the app's no-logging / no-PII posture.
+- **Stripe (secondary, for premium features)**: recurring subscription. On each successful renewal, a fixed monthly credit allowance is granted. Explicitly non-private — a customer choosing this path has already accepted being identified (Stripe holds their name, email, card). Used for premium features that crypto users may not need.
+
+One customer maps to one funding source. A Stripe customer and a crypto customer are separate account rows, never merged.
+
+### Privacy stance
+
+Goal: the server cannot link a customer's wallet address to their IP, and does not hold identifying information for crypto customers.
+
+- **IP ↔ API key link is transient.** On every request the server sees both the peer IP and the `Authorization: Bearer` key. This correlation exists in memory only for the duration of request handling; it is never logged or persisted. Rate-limit store (hashed IP) and credit store (hashed API key) are strictly separate tables with no joining column. A full DB dump gives an attacker no linkage.
+- **Wallet ↔ API key link is broken at topup.** At the moment of funding the server verifies the on-chain deposit event and credits the key's balance. The wallet address is **never** written to the database. See "Crypto payment architecture" below.
+- **Stripe path is a different trust zone.** Customers using Stripe are explicitly identified. This is surfaced in the product copy, not hidden.
+- **No access logs, no APM tracing with request attributes.** Same posture as the rest of the app.
+
+Accepted residual risk: a compromised server can correlate IP-to-key in real time by watching live traffic. Defending against this requires Tor hidden service / mixnet-level infra and is out of scope.
+
+### Identity & auth flow
+
+- **API keys**: random bytes, stored as `sha256(key)` in the DB. The key itself is given to the customer once at issuance and cannot be recovered.
+- **Request authentication**: `Authorization: Bearer <key>` header on every billable request.
+- **Key issuance**:
+  - Crypto path: wallet connect + SIWE-style signature proves ownership of the wallet, server mints an API key and binds the first deposit. No email, no account recovery — lose the key, lose access.
+  - Stripe path: Stripe Checkout flow establishes an email; server mints an API key bound to the `stripe_customer_id`. Key recovery possible via email.
+
+### Crypto payment architecture
+
+**Payment contract with commitment pattern.** Customer calls `deposit(bytes32 keyCommitment)` on a small custom contract, transferring USDC. The contract emits `Deposited(keyCommitment, amount)`. The `keyCommitment` is `sha256(api_key)` so the event does not reveal the key itself.
+
+Why this shape:
+- The event is keyed by commitment, not by wallet. Anyone watching the contract sees `(commitment, amount)` pairs, not `(wallet, commitment)`.
+- The server only reads event logs (never `eth_getTransactionReceipt`), so the wallet address (`receipt.from`) never enters the server process. A DB dump contains no wallet addresses.
+- The transaction sender is still public on-chain — we are not hiding the wallet from observers, only from our own server state.
+
+### Detection — deposit poller
+
+**Chain poller, not client-submitted tx hashes.** The frontend may POST the tx hash for snappier UX, but the server's source of truth is the poller; the POST is just a nudge.
+
+Decisions:
+
+| Choice                  | Value                                            | Rationale                                                                 |
+| ----------------------- | ------------------------------------------------ | ------------------------------------------------------------------------- |
+| Scheduler               | `@elysiajs/cron` plugin                          | Lifecycle-integrated with Elysia; named jobs; room to add more tasks.     |
+| Interval                | 30 seconds (`Patterns.EVERY_30_SECONDS`)         | Trivial RPC cost; user-perceived latency ~30–60s worst case.              |
+| Confirmation depth      | 12 blocks (~2.4 min post-Merge mainnet)          | Acceptable residual reorg risk for small-amount USDC top-ups.             |
+| Range query             | `eth_getLogs` over `[lastProcessed+1, head-12]`  | One RPC call per tick, covers all new blocks at once.                     |
+| Backfill chunk size     | ~5,000 blocks                                    | Below most providers' `eth_getLogs` range caps (Alchemy: 10k).            |
+| Overlap prevention      | `running` flag inside `run()` callback           | Croner (underlying lib) does not protect against overlapping runs.        |
+| Error handling          | Swallow, don't advance pointer, retry next tick  | Self-heals transient failures; no identifying log output.                 |
+| Startup seed            | `last_processed_block = contract_deploy_block`   | Avoid scanning Ethereum history from genesis on first run.                |
+
+Shutdown is handled by the plugin automatically when the Elysia app stops.
+
+### Storage — SQLite via `bun:sqlite`
+
+Zero-ops, single file, sufficient throughput for v1. Swap to Postgres later if multi-instance scaling is needed.
+
+Tables (rough sketch):
+
+- `customers(id, stripe_customer_id NULL, created_at)` — one row per account; either `stripe_customer_id` is set (Stripe path) or it isn't (crypto path). No wallet address stored.
+- `api_keys(key_hash PRIMARY KEY, customer_id, created_at, revoked_at NULL)` — SHA-256 of the key; one customer may hold multiple keys.
+- `credit_balances(customer_id PRIMARY KEY, balance)` — atomic decrement via `UPDATE ... SET balance = balance - ? WHERE customer_id = ? AND balance >= ?` and checking `changes()`.
+- `processed_deposits(tx_hash PRIMARY KEY, commitment, amount, block_number, processed_at)` — `UNIQUE(tx_hash)` is the idempotency guard; re-seeing the same event is a no-op.
+- `indexer_state(key PRIMARY KEY, value)` — single row for `last_processed_block`. Updated in the same transaction that credits balances, so a crash mid-batch leaves the pointer unmoved.
+- `stripe_events(event_id PRIMARY KEY, processed_at)` — webhook idempotency.
+
+### Enforcement middleware
+
+A new middleware sits on billable routes:
+
+1. Read `Authorization: Bearer <key>` from the request.
+2. `sha256(key)` → look up `api_keys` row → resolve `customer_id`.
+3. Read per-endpoint cost from the config file.
+4. Atomic decrement on `credit_balances`; if zero rows affected, return `402 Payment Required`.
+5. Run the handler.
+6. (TBD) Refund the credit if the handler failed due to an upstream / server-side issue.
+
+Middleware order: rate limit first (cheap, in-memory LRU) → credit check (DB hit) → handler.
+
+### Subscription (Stripe) flow
+
+- Customer creates subscription via Stripe Checkout (hosted page). Server stores only `stripe_customer_id`.
+- `invoice.paid` webhook → look up customer → grant the tier's monthly credit allowance to `credit_balances`.
+- Signature verification on every webhook; `stripe_events.event_id` dedupes replays.
+- Subscription lapse (`customer.subscription.deleted`): customer's monthly grants stop; any unconsumed credits remain spendable until gone (or until the rollover policy says otherwise — see open questions).
+
+### Module structure (planned)
+
+```
+src/
+├── modules/
+│   ├── deposits/
+│   │   ├── index.ts          # @elysiajs/cron registration + HTTP endpoints
+│   │   ├── service.ts        # DepositsService: eth_getLogs, parse, credit
+│   │   └── poller.ts         # Tick function with overlap guard
+│   └── billing/
+│       ├── index.ts          # Stripe webhook endpoint, signature verification
+│       └── service.ts        # BillingService: subscription state, credit grants
+├── lib/
+│   ├── db.ts                 # bun:sqlite handle + schema init
+│   ├── credits.ts            # Atomic decrement / refund / grant helpers
+│   └── auth.ts               # API key hashing + lookup
+└── config/
+    └── pricing.ts            # Per-endpoint credit cost map
+```
+
+Endpoints tentatively:
+
+- `POST /deposits/notify` — client nudges the server with a tx hash (optional; poller is source of truth).
+- `GET /deposits/:tx_hash/status` — polled by the frontend to flip the UI from "pending" to "credited".
+- `POST /billing/stripe/webhook` — Stripe webhook sink.
+- Future: account management endpoints (key rotation, balance query, etc.).
+
+### Open questions (still to decide)
+
+- **Rollover policy for subscription credits.** Expire monthly (simple, customer-hostile), roll over uncapped (customer-friendly, builds financial liability), or roll over capped (typical). Affects the schema — may need a separate `subscription_credits` column with an expiration timestamp.
+- **Single vs split bucket.** When a Stripe subscriber also tops up with crypto, are those one balance or two? Leaning split (spend subscription credits first; they may expire; top-up credits never do), but open to debate.
+- **Refund semantics on request failure.** Upstream times out → refund? Upstream returns a valid JSON-RPC error response → charge (server did the work)? Customer sent malformed input → charge? Tentative rule: "refund only when the server itself failed, not when the upstream returned an answer we proxied."
+- **Credit pricing.** How much is 1 credit in USDC? Flat rate, bulk discount, tier-based?
+- **Subscription tier structure.** One tier or several? Maps to Stripe Prices.
+- **Frontend auth specifics.** SIWE message format, session token lifetime, key storage (localStorage vs HTTP-only cookie set after SIWE).
+- **Reverse-proxy IP handling.** Existing rate-limit deployment note applies here too: if we ever sit behind an LB/CDN, the generator must read `x-forwarded-for` before stripping it.
+- **Observability.** Aggregate metrics (total calls per endpoint, deposits/day, revenue) are fine. Per-customer metrics require an authenticated account view; none are written to third-party APM tools.
+
+### What's locked in
+
+- Model: credits as universal currency; Stripe = monthly grant, crypto = top-up.
+- Two separate account types, never merged.
+- Payment contract with commitment pattern; wallet address never persisted server-side.
+- Poller: `@elysiajs/cron`, 30s interval, 12 block depth, `eth_getLogs` per tick, overlap guard flag.
+- Poller reads event logs only, never transaction receipts.
+- Storage: SQLite via `bun:sqlite`; in-process poller for v1.
+- Atomic decrement with row-affected check for credit deduction.
+- API keys stored as SHA-256 hashes; `Authorization: Bearer` header.
+- Idempotency: `UNIQUE(tx_hash)` for deposits, Stripe event IDs for webhooks.
