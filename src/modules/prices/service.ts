@@ -60,6 +60,21 @@ const ZERO_ADDRESS: Address = "0x0000000000000000000000000000000000000000";
 const WETH_ADDRESS: Address = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2";
 
 /**
+ * Stablecoins we treat as worth exactly $1, bypassing the on-chain price
+ * read entirely. Real-world depeg events are rare enough — and the
+ * downstream UX cost of showing "0.9994" for USDC is high enough — that
+ * pinning to "1" gives users a more useful answer than the oracle does.
+ * Lowercased so address comparisons are case-insensitive.
+ */
+const STABLECOIN_ADDRESSES: ReadonlySet<string> = new Set(
+  [
+    "0x6B175474E89094C44Da98b954EedeAC495271d0F", // DAI
+    "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", // USDC
+    "0xdAC17F958D2ee523a2206206994597C13D831ec7", // USDT
+  ].map((a) => a.toLowerCase())
+);
+
+/**
  * viem public client, created once and reused across requests. `http()`
  * is a keep-alive HTTP transport. Each call to `publicClient.multicall`
  * automatically routes through the Multicall3 contract deployed at the
@@ -128,6 +143,9 @@ export abstract class PricesService {
     // the string form so the frontend gets a decimal USD value ready to
     // display (no bigint → decimal conversion needed client-side).
     return ETHEREUM_TOKENS.map((token, i) => {
+      if (STABLECOIN_ADDRESSES.has(token.address.toLowerCase())) {
+        return { chainId: token.chainId, address: token.address, price: "1" };
+      }
       const result = results[i];
       return {
         chainId: token.chainId,
