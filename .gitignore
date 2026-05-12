@@ -40,3 +40,9 @@ yarn-error.log*
 **/*.log
 package-lock.json
 **/*.bun
+
+# sqlite
+*.db
+*.db-journal
+*.db-wal
+*.db-shm

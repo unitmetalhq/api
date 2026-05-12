@@ -24,9 +24,14 @@
  * KyberSwap's sentinel address for the chain's native token (ETH, BNB, ...).
  * Use this for `tokenIn` or `tokenOut` instead of the wrapped address when
  * you want to swap from/to the native asset directly.
+ *
+ * MUST be all-lowercase: KyberSwap's `routeSummary.checksum` is computed
+ * server-side over the lowercase form, so injecting the EIP-55 mixed-case
+ * form (`0xEeee…EeeE`) here makes `buildRoute` fail with code 4222
+ * ("quoted amount is smaller than estimated") on every native-token swap.
  */
 export const KYBER_NATIVE_TOKEN_ADDRESS =
-  "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE";
+  "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 
 /**
  * The frontend convention (Uniswap-style) is to represent the native token

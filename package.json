@@ -7,15 +7,20 @@
     "build": "bun build --compile --minify-whitespace --minify-syntax --target bun --outfile ../unitmetal-api-build src/index.ts"
   },
   "dependencies": {
+    "@coingecko/coingecko-typescript": "^5.1.1",
     "@elysia/cron": "^1.4.2",
     "@elysia/openapi": "^1.4.15",
     "@elysiajs/cors": "^1.4.1",
+    "better-sqlite3": "^12.9.0",
+    "drizzle-orm": "^0.45.2",
     "elysia": "latest",
     "elysia-rate-limit": "^4.6.0",
     "viem": "^2.48.4"
   },
   "devDependencies": {
-    "bun-types": "latest"
+    "@types/better-sqlite3": "^7.6.13",
+    "bun-types": "latest",
+    "drizzle-kit": "^0.31.10"
   },
   "module": "src/index.js"
 }

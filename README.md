@@ -26,6 +26,23 @@ Open http://localhost:8000/ with your browser to see the result.
 
 `bun run test` loads `.env.local` explicitly via `--env-file`, because `bun test` deliberately ignores `.env.local` by default.
 
+## Database
+
+SQLite via `bun:sqlite` (built into Bun, no native addon to compile), with [Drizzle ORM](https://orm.drizzle.team) as the schema/query layer.
+
+- **DB file** — defaults to `./data.db` at the process cwd. Override with `DATABASE_PATH` in `.env.local`. The `*.db*` family is gitignored.
+- **Connection** — `src/lib/db.ts` opens one process-wide handle and enables WAL so route reads don't block the cron writer.
+- **Schemas** — colocated with each feature module: `src/modules/<feature>/schema.ts`. `drizzle.config.ts` globs `src/modules/*/schema.ts` so adding a new feature picks up automatically.
+- **Applying schema changes** (no scripts added to `package.json` yet — run drizzle-kit directly):
+
+  ```bash
+  bun drizzle-kit push       # dev: push current schema straight to the DB
+  bun drizzle-kit generate   # produce a versioned migration in ./drizzle
+  bun drizzle-kit migrate    # apply pending migrations from ./drizzle
+  ```
+
+  Use `push` for local iteration; switch to `generate` + `migrate` once the schema is something you want to version.
+
 ## Project Structure
 
 ```
